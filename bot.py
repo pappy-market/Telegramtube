@@ -16,24 +16,40 @@ Secrets are read from environment variables — NEVER hardcode them here:
 Run locally for testing:
   BOT_TOKEN=xxx YOUTUBE_API_KEY=yyy python bot.py
 
-On Render:
+On Render (deploy as a FREE "Web Service", not a paid Background Worker):
   Build Command:  pip install python-telegram-bot==21.6 requests
   Start Command:  python bot.py
   Environment variables: BOT_TOKEN, YOUTUBE_API_KEY  (set in Render dashboard, not in code)
+
+Note: Render's free tier only exists for "Web Service" type, which requires
+listening on a port. This script starts a tiny dummy HTTP server in a
+background thread purely to satisfy that requirement -- it does nothing
+else. The actual bot logic still runs via Telegram polling, unaffected.
 """
 
 import os
 import json
 import sqlite3
 import logging
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import requests
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ForceReply,
+    LinkPreviewOptions,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -192,7 +208,10 @@ def build_keyboard(video_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⭐ Save", callback_data=f"save:{video_id}"),
                 InlineKeyboardButton("💬 Comments", callback_data=f"comment:{video_id}"),
             ],
-            [InlineKeyboardButton("➡️ Next", callback_data="next")],
+            [
+                InlineKeyboardButton("🔍 Search", callback_data="search_prompt"),
+                InlineKeyboardButton("➡️ Next", callback_data="next"),
+            ],
         ]
     )
 
@@ -200,7 +219,7 @@ def build_keyboard(video_id: str) -> InlineKeyboardMarkup:
 async def send_current_video(user_id: int, context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     user = get_user(user_id)
     if not user["video_ids"]:
-        await context.bot.send_message(chat_id, "No videos loaded yet — try /search <topic>.")
+        await context.bot.send_message(chat_id, "No videos loaded yet — tap 🔍 Search below.")
         return
     idx = user["current_index"] % len(user["video_ids"])
     video_id = user["video_ids"][idx]
@@ -218,7 +237,14 @@ async def send_current_video(user_id: int, context: ContextTypes.DEFAULT_TYPE, c
         build_caption(video, liked, saved),
         parse_mode="Markdown",
         reply_markup=build_keyboard(video_id),
-        disable_web_page_preview=False,
+        # prefer_large_media asks Telegram to render the biggest possible
+        # inline preview (closer to a "video card" look). Whether it plays
+        # inline vs. opens the YouTube app still depends on the user's
+        # Telegram client -- that part isn't controllable from bot code.
+        link_preview_options=LinkPreviewOptions(
+            is_disabled=False,
+            prefer_large_media=True,
+        ),
     )
 
 
@@ -234,8 +260,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         save_user(user_id, video_ids=video_ids, current_index=0)
     await context.bot.send_message(
         chat_id,
-        "🎥 Welcome! Here's your feed — tap Next to keep scrolling, "
-        "or use /search <topic> to find something specific.",
+        "🎥 Welcome! Here's your feed — tap ➡️ Next to keep scrolling, "
+        "or tap 🔍 Search to find something specific.",
     )
     await send_current_video(user_id, context, chat_id)
 
@@ -247,6 +273,23 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not query:
         await context.bot.send_message(chat_id, "Usage: /search cooking recipes")
         return
+    video_ids = youtube_search(query)
+    if not video_ids:
+        await context.bot.send_message(chat_id, f"No results found for '{query}'.")
+        return
+    save_user(user_id, video_ids=video_ids, current_index=0)
+    await context.bot.send_message(chat_id, f"🔎 Results for: {query}")
+    await send_current_video(user_id, context, chat_id)
+
+
+async def handle_search_reply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Catches the user's typed reply to the '🔍 What do you want to search for?' prompt."""
+    replied_to = update.message.reply_to_message
+    if not replied_to or "search for" not in (replied_to.text or ""):
+        return  # not a reply to our search prompt -- ignore
+    query = update.message.text.strip()
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
     video_ids = youtube_search(query)
     if not video_ids:
         await context.bot.send_message(chat_id, f"No results found for '{query}'.")
@@ -269,6 +312,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             new_index = (user["current_index"] + 1) % len(user["video_ids"])
             save_user(user_id, current_index=new_index)
         await send_current_video(user_id, context, chat_id)
+        return
+
+    if data == "search_prompt":
+        # Ask the user to type a keyword; the reply is caught by
+        # handle_search_reply() below via the ForceReply marker.
+        await context.bot.send_message(
+            chat_id,
+            "🔍 What do you want to search for?",
+            reply_markup=ForceReply(selective=True, input_field_placeholder="e.g. cooking recipes"),
+        )
         return
 
     action, video_id = data.split(":", 1)
@@ -302,14 +355,40 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
+# Dummy web server (only exists so Render's free "Web Service" tier
+# sees an open port and considers the deploy healthy)
+# ---------------------------------------------------------------------------
+class _HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running.")
+
+    def log_message(self, format, *args):
+        pass  # silence noisy default request logging
+
+
+def start_dummy_server():
+    port = int(os.environ.get("PORT", 10000))  # Render sets PORT automatically
+    server = HTTPServer(("0.0.0.0", port), _HealthCheckHandler)
+    logger.info(f"Dummy web server listening on port {port} (health check only)")
+    server.serve_forever()
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
     db_connect().close()  # ensure table exists on boot
+
+    # Run the dummy web server in a background thread so Render sees a live port
+    threading.Thread(target=start_dummy_server, daemon=True).start()
+
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("search", search))
     app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_search_reply))
     logger.info("Bot starting (polling mode)...")
     app.run_polling()
 
